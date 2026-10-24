@@ -1984,6 +1984,16 @@ static void disco_periodic_probes(microlink_t *ml) {
             ml->config_httpd, p->vpn_ip);
         bool warm = disco_peer_is_warm(ml, p);
 
+        /* The persistent keepalive follows the same rule (tailscaled sets
+         * none): toward an idle peer it would send a packet every
+         * t_wg_keepalive_s and, through peer_wants_session(), rekey a session
+         * nobody uses. The next packet makes the peer warm and brings the
+         * keepalive back on the following tick. */
+        if (ml->wg_netif && p->wg_peer_index >= 0) {
+            wireguardif_set_keepalive((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index,
+                                      warm ? ml->t_wg_keepalive_s : 0);
+        }
+
         /* Check if direct path trust has expired (always runs, not throttled).
          *
          * Throughput-collapse fix (2026-05-24): the old code unconditionally

@@ -509,7 +509,7 @@ All settings via `idf.py menuconfig` → MicroLink V2 Configuration.
 | `disco_heartbeat_ms` | `3000` | DISCO keepalive interval |
 | `stun_interval_ms` | `23000` | STUN re-probe interval |
 | `ctrl_watchdog_ms` | `120000` | Control plane watchdog timeout |
-| `wg_keepalive_s` | `25` | WireGuard persistent keepalive for every peer (`-1` = off, at most `55`) |
+| `wg_keepalive_s` | `25` | WireGuard persistent keepalive toward peers whose path is maintained (see `keep_all_peers_warm`; `-1` = off, at most `55`) |
 | `wifi_tx_power_dbm` | `0` (default) | WiFi TX power in dBm |
 
 ### Kconfig Options (`idf.py menuconfig`)

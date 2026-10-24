@@ -135,7 +135,7 @@ extern "C" {
 #define ML_DISCO_BEST_STICKY_MS         6500    /* keep best_ip/port while it answered this recently (trustUDPAddrDuration) */
 #define ML_DISCO_FULL_PING_MS           60000   /* heartbeat fans out to every endpoint this often, else best only (upgradeUDPDirectInterval) */
 
-/* WireGuard persistent keepalive (seconds) applied to every peer */
+/* WireGuard persistent keepalive (seconds) toward warm peers */
 #define ML_WG_KEEPALIVE_S               25
 /* Upper bound: wireguard-lwip rekeys on receive at REJECT_AFTER_TIME - keepalive - REKEY_TIMEOUT
  * (180 - k - 5 s), before REKEY_AFTER_TIME (120 s) above 55 s, wrapping from 175 s */
