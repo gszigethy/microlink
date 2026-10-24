@@ -1941,6 +1941,30 @@ bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
 
 static int disco_probe_start_idx = 0;
 
+/* Does this peer get path maintenance (heartbeat, upgrade probe, trust
+ * re-probe, DERP handshake retry)? tailscaled's endpoint.heartbeat() stops
+ * once nothing was sent to the peer for sessionActiveTimeout (45 s) and an
+ * idle peer costs it nothing until the next packet, which goes out over DERP
+ * and restarts discovery. Here a received packet counts too, so a device that
+ * is only ever polled keeps its direct path. The exit node and the priority
+ * peer are always maintained: their first packet should not wait for an
+ * upgrade. */
+static bool disco_peer_is_warm(microlink_t *ml, const ml_peer_t *p) {
+    if (ml->config.keep_all_peers_warm) return true;
+    if ((ml->config.exit_node_ip && p->vpn_ip == ml->config.exit_node_ip) ||
+        (ml->config.priority_peer_ip && p->vpn_ip == ml->config.priority_peer_ip)) {
+        return true;
+    }
+    if (!ml->wg_netif || p->wg_peer_index < 0) return false;
+
+    uint32_t tx_age_ms, rx_age_ms;
+    if (wireguardif_peer_activity((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index,
+                                  &tx_age_ms, &rx_age_ms) != ERR_OK) {
+        return false;
+    }
+    return tx_age_ms < ML_DISCO_SESSION_ACTIVE_MS || rx_age_ms < ML_DISCO_SESSION_ACTIVE_MS;
+}
+
 static void disco_periodic_probes(microlink_t *ml) {
     uint64_t now = ml_get_time_ms();
     int upgrade_probes_sent = 0;
@@ -1958,6 +1982,7 @@ static void disco_periodic_probes(microlink_t *ml) {
          * Inbound DISCO pings from any peer are still answered (don't break remote). */
         bool peer_allowed = ml_config_peer_is_allowed(
             ml->config_httpd, p->vpn_ip);
+        bool warm = disco_peer_is_warm(ml, p);
 
         /* Check if direct path trust has expired (always runs, not throttled).
          *
@@ -1980,6 +2005,11 @@ static void disco_periodic_probes(microlink_t *ml) {
          *      probe re-fires, and burst 3 DISCO PINGs to recover trust.
          *   3. If data is ALSO stale, then the path really is dead and the
          *      old behaviour (zero endpoint + DERP handshake) is correct.
+         *
+         * An idle peer (!warm) gets no re-probe and no handshake: its output
+         * is only moved to DERP, so the first packet after the idle spell
+         * cannot vanish into a direct path nobody checked, and that packet
+         * makes the peer warm again, which restarts the upgrade probe.
          */
         if (p->has_direct_path && now > p->trust_until_ms) {
             /* Look up WG-side last_rx age before deciding. */
@@ -2017,7 +2047,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                     ESP_LOGI(TAG, "Direct path PING-stale for %s but data flowing "
                                   "(last_rx=%ums) - keeping endpoint, single PING",
                              p->hostname, (unsigned)last_rx_age_ms);
-                    if (!ml_at_socket_is_ready()) {
+                    if (warm && !ml_at_socket_is_ready()) {
                         disco_send_ping_to_peer(ml, i, true);
                     }
                 } else {
@@ -2028,7 +2058,11 @@ static void disco_periodic_probes(microlink_t *ml) {
                         struct netif *netif = (struct netif *)ml->wg_netif;
                         session_up = (wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
                                                              NULL, NULL) == ERR_OK);
-                        if (session_up) {
+                        if (!warm) {
+                            ESP_LOGI(TAG, "Direct path to %s expired while idle, "
+                                          "output parked on DERP", p->hostname);
+                            wireguardif_set_derp_endpoint(netif, (u8_t)p->wg_peer_index);
+                        } else if (session_up) {
                             ESP_LOGI(TAG, "Direct path to %s expired (last_rx=%ums), "
                                           "reverting to DERP", p->hostname,
                                      (unsigned)last_rx_age_ms);
@@ -2036,7 +2070,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                             ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
                         }
                     }
-                    if (!session_up) {
+                    if (!session_up && warm) {
                         /* No WireGuard session behind this path, nothing to
                          * fall back: this is the once-a-minute re-probe of a
                          * session-less peer (see the heartbeat gate below). */
@@ -2044,7 +2078,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                                  p->hostname, (unsigned)(ML_DISCO_TRUST_DURATION_MS / 1000));
                     }
                     /* One force-ping to try re-establishing direct path. */
-                    if (!ml_at_socket_is_ready()) {
+                    if (warm && !ml_at_socket_is_ready()) {
                         disco_send_ping_to_peer(ml, i, true);
                     }
                 }
@@ -2075,7 +2109,12 @@ static void disco_periodic_probes(microlink_t *ml) {
          * throughput case (keypair valid, DISCO pings starved) is likewise
          * untouched. The 30 s attempt cadence is uniform so PONGs that clear
          * derp_fallback_active can't make us re-fire faster than every 30 s. */
-        if (p->wg_peer_index >= 0 && ml->wg_netif && p->online &&
+        /* Only for a warm peer. An idle one needs no session: the first
+         * packet toward it starts the handshake from the output path (over
+         * DERP while it has no endpoint), and a peer that wants to reach us
+         * initiates itself. Without this gate every online peer of the
+         * tailnet got a DERP handshake every 30 s, for ever. */
+        if (warm && p->wg_peer_index >= 0 && ml->wg_netif && p->online &&
             now - p->peer_added_ms > 30000) {
             struct netif *netif = (struct netif *)ml->wg_netif;
             err_t up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
@@ -2103,8 +2142,9 @@ static void disco_periodic_probes(microlink_t *ml) {
          * 1 s tick above the 30 ms SLOW mark. p->online is the netmap
          * Node.Online tri-state (unknown => true), so this only skips peers
          * the control plane has explicitly reported offline; the next
-         * PeersChanged delta that flips them back re-enables probing. */
-        if (!ml_at_socket_is_ready() && !p->has_direct_path && p->online &&
+         * PeersChanged delta that flips them back re-enables probing.
+         * Nor toward an idle peer: there is no traffic to upgrade. */
+        if (warm && !ml_at_socket_is_ready() && !p->has_direct_path && p->online &&
             now - p->last_upgrade_ms > ML_DISCO_UPGRADE_INTERVAL_MS) {
             if (upgrade_probes_sent < DISCO_PROBES_PER_TICK) {
                 disco_send_ping_to_peer(ml, i, false);
@@ -2119,16 +2159,16 @@ static void disco_periodic_probes(microlink_t *ml) {
          * always block heartbeat pings.
          * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms.
          *
-         * Only behind a WireGuard session, though. The reference client
-         * heartbeats a peer only while it has traffic for it
-         * (sessionActiveTimeout) and sends an idle one nothing; here the
-         * heartbeat protects the single data-plane endpoint of a live session,
-         * so it runs for as long as the session does, but a peer that never
-         * completed a handshake gets no heartbeat at all -- its address is
-         * refreshed once a minute by the trust-expiry re-probe above. Before
-         * this gate every session-less peer was pinged every 3 s for ever
-         * (esphome-tailscale#46, direction 3). */
-        if (p->has_direct_path &&
+         * Only behind a WireGuard session, though, and only while the peer
+         * is warm. The reference client heartbeats a peer only while it has
+         * traffic for it (sessionActiveTimeout) and sends an idle one nothing;
+         * an idle peer's path here simply runs out of trust and its output is
+         * parked on DERP by the trust-expiry block above. A peer that never
+         * completed a handshake gets no heartbeat at all -- while warm, its
+         * address is refreshed once a minute by the trust-expiry re-probe.
+         * Before these gates every peer with a direct path was pinged every
+         * 3 s for ever (esphome-tailscale#46, direction 3). */
+        if (warm && p->has_direct_path &&
             now - p->last_ping_sent_ms > ml->t_disco_heartbeat_ms) {
             bool session_up = false;
             if (ml->wg_netif && p->wg_peer_index >= 0) {

@@ -51,6 +51,13 @@ typedef struct {
      * ip4_route_src_hook). 0 = no exit node selected. */
     uint32_t exit_node_ip;
 
+    /* Path maintenance (DISCO heartbeat, upgrade probes, trust re-probe,
+     * DERP handshake retry) runs only for peers that carried a tunnelled
+     * packet in the last 45 s, plus the exit node and the priority peer;
+     * an idle peer is reached over DERP on its first packet and upgraded
+     * from there. true = maintain every peer all the time (old behaviour). */
+    bool keep_all_peers_warm;
+
     /* Optional timing overrides (0 = use defaults) */
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
