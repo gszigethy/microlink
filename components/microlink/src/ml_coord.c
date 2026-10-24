@@ -3638,7 +3638,7 @@ void ml_coord_task(void *arg) {
             }
 
             /* Send initial HTTP/2 PING immediately to keep connection active
-             * before the periodic 5s timer kicks in (server has ~20s idle timeout) */
+             * before the periodic one (t_ctrl_ping_interval_ms) takes over */
             {
                 uint8_t ping_frame[17];
                 ping_frame[0] = 0x00; ping_frame[1] = 0x00; ping_frame[2] = 0x08;
@@ -3867,11 +3867,15 @@ void ml_coord_task(void *arg) {
                     }
                 }
 
-                /* Send HTTP/2 PING every 5 seconds to keep control plane alive.
-                 * The server has a ~20s idle timeout; PINGs maintain bidirectional
-                 * activity and are what actually keep us "online". (v1 reference) */
+                /* Send HTTP/2 PING every t_ctrl_ping_interval_ms (default 5 s).
+                 * The 5 s cadence comes from the v1 client, which assumed a ~20 s
+                 * idle timeout on the way to the server; tailscaled sends no
+                 * PINGs and relies on the mapSession's KeepAlive MapResponse,
+                 * roughly once a minute. A longer interval cuts idle traffic.
+                 * PING ACKs also feed the control watchdog, so keep the interval
+                 * well below ctrl_watchdog_ms. */
                 static uint64_t last_h2_ping_ms = 0;
-                if (now - last_h2_ping_ms >= 5000) {
+                if (now - last_h2_ping_ms >= ml->t_ctrl_ping_interval_ms) {
                     uint8_t ping_frame[17];
                     ping_frame[0] = 0x00; ping_frame[1] = 0x00; ping_frame[2] = 0x08;
                     ping_frame[3] = 0x06;  /* Type: PING */

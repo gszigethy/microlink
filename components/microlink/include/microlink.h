@@ -62,6 +62,7 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+    uint32_t ctrl_ping_interval_ms; /* HTTP/2 PING interval on the control connection (default: 5000) */
     int16_t wg_keepalive_s;         /* WireGuard persistent keepalive toward warm peers (default: 25, max 55, <0 = off) */
 
     /* Custom control plane host (NULL or empty = Tailscale SaaS at

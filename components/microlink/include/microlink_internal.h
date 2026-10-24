@@ -158,6 +158,7 @@ extern "C" {
 #define ML_CTRL_WATCHDOG_MS             120000
 #define ML_CTRL_BACKOFF_MAX_MS          30000
 #define ML_CTRL_KEEPALIVE_MS            60000
+#define ML_CTRL_PING_INTERVAL_MS        5000
 /* Stream-liveness watchdog: the mapSession sends a KeepAlive MapResponse
  * roughly every minute (we request KeepAlive=true), so this allows ~5
  * consecutive misses before declaring the session dead. Deliberately much
@@ -662,6 +663,7 @@ struct microlink_s {
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
     uint32_t t_ctrl_watchdog_ms;
+    uint32_t t_ctrl_ping_interval_ms;
     uint16_t t_wg_keepalive_s;      /* 0 = no persistent keepalive */
 
     /* Callbacks */
