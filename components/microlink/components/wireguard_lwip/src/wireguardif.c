@@ -367,6 +367,11 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 	uint32_t now;
 	struct wireguard_keypair *keypair = &peer->curr_keypair;
 
+	// Count the attempt, not the success: traffic that is waiting on a handshake is still traffic
+	if (q) {
+		peer->last_payload_tx = wireguard_sys_now();
+	}
+
 	// Note: We may not be able to use the current keypair if we haven't received data, may need to resort to using previous keypair
 	if (keypair->valid && (!keypair->initiator) && (keypair->last_rx == 0)) {
 		keypair = &peer->prev_keypair;
@@ -676,6 +681,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					netif_set_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
+						peer->last_payload_rx = now;
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
 						iphdr = (struct ip_hdr *)pbuf->payload;
 						// Replay was checked inside wireguard_decrypt_packet; require a complete header before reading it
@@ -1172,6 +1178,29 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 		}
 		if (current_port) {
 			*current_port = peer->port;
+		}
+	}
+	return result;
+}
+
+static uint32_t payload_age(uint32_t stamp, uint32_t now) {
+	return stamp ? (now - stamp) : UINT32_MAX;
+}
+
+err_t wireguardif_peer_activity(struct netif *netif, u8_t peer_index, uint32_t *tx_age_ms, uint32_t *rx_age_ms) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		// Stamps first, clock second: a stamp another task writes in between is then never newer
+		// than `now`, so the age cannot wrap around to "ages ago".
+		uint32_t tx = peer->last_payload_tx;
+		uint32_t rx = peer->last_payload_rx;
+		uint32_t now = wireguard_sys_now();
+		if (tx_age_ms) {
+			*tx_age_ms = payload_age(tx, now);
+		}
+		if (rx_age_ms) {
+			*rx_age_ms = payload_age(rx, now);
 		}
 	}
 	return result;

@@ -143,6 +143,10 @@ err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index);
 // Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
+// How long ago (ms) an inner IP packet was last sent to / received from the given peer; UINT32_MAX = never.
+// Keepalives and handshakes do not count. Either out-pointer may be NULL.
+err_t wireguardif_peer_activity(struct netif *netif, u8_t peer_index, uint32_t *tx_age_ms, uint32_t *rx_age_ms);
+
 // Does any peer own this address as a host route (an allowed IP with a /32 mask)? Tailnet peers are
 // programmed exactly like that, so this answers "is this address a tailnet node" without being fooled
 // by an exit-node peer's 0.0.0.0/0. Read-only; call it from the TCP/IP thread.
