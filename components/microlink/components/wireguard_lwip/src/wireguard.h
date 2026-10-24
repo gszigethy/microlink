@@ -195,6 +195,11 @@ struct wireguard_peer {
 	// unanswered. wireguard-go's timerNewHandshake: armed by data (not keepalives),
 	// disarmed by anything authenticated from the peer, fires after 15 s.
 	uint32_t last_data_tx;
+	// Last time an inner IP packet was handed to us for this peer / decrypted from it,
+	// 0 = never. Unlike last_tx/last_rx these ignore keepalives and handshakes, and unlike
+	// last_data_tx they are never cleared: "is anything using this tunnel".
+	uint32_t last_payload_tx;
+	uint32_t last_payload_rx;
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;
@@ -203,8 +208,13 @@ struct wireguard_peer {
 	// Incremented in wireguard_start_handshake(), reset in wireguard_start_session().
 	// When >= MAX_HANDSHAKE_ATTEMPTS, should_send_initiation() stops emitting
 	// to avoid wasted retries against peers that have us trimmed. Outgoing
-	// traffic (ERR_CONN path in wireguardif_output_to_peer) re-arms.
+	// traffic (the no-key path in wireguardif_output_to_peer) re-arms.
 	uint8_t handshake_attempts;
+
+	// The last packet that found no session (wireguard-go's staged packets, one deep), sent once
+	// a session is up. The output path and the RX path hand it over with atomic exchanges.
+	struct pbuf *staged;
+	uint32_t staged_millis;
 };
 
 struct wireguard_device {

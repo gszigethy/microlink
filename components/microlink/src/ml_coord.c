@@ -84,6 +84,33 @@ void ml_bind_sock_to_upstream(microlink_t *ml, int fd)
     }
 }
 
+/* IPv4 address (network byte order) the ESP's own UDP leaves from: the
+ * pinned upstream netif in exit-node mode, else the esp_netif default
+ * (WiFi STA or Ethernet, whichever is the uplink), else the STA. The SoftAP
+ * is not an uplink (it becomes the default when nothing else is up), and
+ * PPP is skipped: behind carrier NAT its address is useless to a peer, and
+ * STUN already supplies the public one. 0 when there is no such address or
+ * its netif is down. */
+uint32_t ml_uplink_ipv4(microlink_t *ml)
+{
+    if (ml && ml->upstream_netif) {
+        const struct netif *up = (const struct netif *)ml->upstream_netif;
+        if (up->name[0] == 'p' && up->name[1] == 'p') return 0;   /* lwIP's PPP netif */
+        return netif_is_up(up) ? ip4_addr_get_u32(netif_ip4_addr(up)) : 0;
+    }
+    esp_netif_t *nif = esp_netif_get_default_netif();
+    const char *key = nif ? esp_netif_get_ifkey(nif) : NULL;
+    if (!nif || (key && strcmp(key, "WIFI_AP_DEF") == 0)) {
+        nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        key = nif ? esp_netif_get_ifkey(nif) : NULL;
+    }
+    if (!nif || !esp_netif_is_netif_up(nif)) return 0;
+    if (key && strncmp(key, "PPP", 3) == 0) return 0;
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(nif, &ip_info) != ESP_OK) return 0;
+    return ip_info.ip.addr;
+}
+
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
@@ -2132,7 +2159,7 @@ check_removed:
 }
 
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
- * Includes: WiFi LAN endpoint (type=Local), STUN IPv4 (type=STUN),
+ * Includes: uplink LAN endpoint (type=Local), STUN IPv4 (type=STUN),
  * STUN IPv6 (type=STUN). Returns number of endpoints added. */
 static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     int count = 0;
@@ -2140,23 +2167,20 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     cJSON *et_array = cJSON_AddArrayToObject(root, "EndpointTypes");
     if (!ep_array || !et_array) return 0;
 
-    /* LAN endpoint (WiFi STA) */
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta_netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
-            char ep_str[32];
-            snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
-                     (unsigned long)((local_ip >> 24) & 0xFF),
-                     (unsigned long)((local_ip >> 16) & 0xFF),
-                     (unsigned long)((local_ip >> 8) & 0xFF),
-                     (unsigned long)(local_ip & 0xFF),
-                     ml->disco_local_port);
-            cJSON_AddItemToArray(ep_array, cJSON_CreateString(ep_str));
-            cJSON_AddItemToArray(et_array, cJSON_CreateNumber(1));  /* EndpointLocal */
-            count++;
-        }
+    /* LAN endpoint (uplink netif: WiFi STA or Ethernet) */
+    uint32_t uplink_ip = ml_uplink_ipv4(ml);
+    if (uplink_ip != 0) {
+        uint32_t local_ip = ntohl(uplink_ip);
+        char ep_str[32];
+        snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
+                 (unsigned long)((local_ip >> 24) & 0xFF),
+                 (unsigned long)((local_ip >> 16) & 0xFF),
+                 (unsigned long)((local_ip >> 8) & 0xFF),
+                 (unsigned long)(local_ip & 0xFF),
+                 ml->disco_local_port);
+        cJSON_AddItemToArray(ep_array, cJSON_CreateString(ep_str));
+        cJSON_AddItemToArray(et_array, cJSON_CreateNumber(1));  /* EndpointLocal */
+        count++;
     }
 
     /* PPP endpoint (cellular) — use STUN-discovered public IP as our endpoint */
@@ -3638,7 +3662,7 @@ void ml_coord_task(void *arg) {
             }
 
             /* Send initial HTTP/2 PING immediately to keep connection active
-             * before the periodic 5s timer kicks in (server has ~20s idle timeout) */
+             * before the periodic one (t_ctrl_ping_interval_ms) takes over */
             {
                 uint8_t ping_frame[17];
                 ping_frame[0] = 0x00; ping_frame[1] = 0x00; ping_frame[2] = 0x08;
@@ -3681,7 +3705,7 @@ void ml_coord_task(void *arg) {
 
                 /* Stream-liveness watchdog (#32). The transport can look
                  * perfectly healthy — the server's HTTP/2 front end keeps
-                 * ACKing our 5 s PINGs, resetting last_activity_ms — while
+                 * ACKing our PINGs, resetting last_activity_ms — while
                  * the server-side mapSession is silently gone: the admin
                  * console shows the node offline, netmap updates stop, new
                  * peers can't reach us, and existing tunnels keep working
@@ -3801,9 +3825,15 @@ void ml_coord_task(void *arg) {
                     }
                 }
 
-                /* Periodic STUN re-probe (every 23s) — fresh probe sequence */
+                /* Periodic STUN re-probe (every 23s) — fresh probe sequence.
+                 * While no peer carries traffic only every
+                 * t_stun_idle_interval_ms: tailscaled skips periodic re-STUN
+                 * altogether once idle for sessionActiveTimeout, and the first
+                 * pass after the idle spell ends is due at once. */
                 static uint64_t last_stun_ms = 0;
-                if (now - last_stun_ms > ml->t_stun_interval_ms) {
+                uint32_t stun_interval_ms = ml->peers_idle ? ml->t_stun_idle_interval_ms
+                                                           : ml->t_stun_interval_ms;
+                if (now - last_stun_ms > stun_interval_ms) {
                     ml->stun_retry_count = 1;
                     ml->stun_using_fallback = false;
                     ml->stun_last_probe_ms = now;
@@ -3867,11 +3897,15 @@ void ml_coord_task(void *arg) {
                     }
                 }
 
-                /* Send HTTP/2 PING every 5 seconds to keep control plane alive.
-                 * The server has a ~20s idle timeout; PINGs maintain bidirectional
-                 * activity and are what actually keep us "online". (v1 reference) */
+                /* Send HTTP/2 PING every t_ctrl_ping_interval_ms (default 5 s).
+                 * The 5 s cadence comes from the v1 client, which assumed a ~20 s
+                 * idle timeout on the way to the server; tailscaled sends no
+                 * PINGs and relies on the mapSession's KeepAlive MapResponse,
+                 * roughly once a minute. A longer interval cuts idle traffic.
+                 * PING ACKs also feed the control watchdog, so keep the interval
+                 * well below ctrl_watchdog_ms. */
                 static uint64_t last_h2_ping_ms = 0;
-                if (now - last_h2_ping_ms >= 5000) {
+                if (now - last_h2_ping_ms >= ml->t_ctrl_ping_interval_ms) {
                     uint8_t ping_frame[17];
                     ping_frame[0] = 0x00; ping_frame[1] = 0x00; ping_frame[2] = 0x08;
                     ping_frame[3] = 0x06;  /* Type: PING */
@@ -3884,8 +3918,10 @@ void ml_coord_task(void *arg) {
                         ping_frame[9 + b] = (ping_id >> (56 - b * 8)) & 0xFF;
                     int ping_ret = noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
                     if (ping_ret >= 0) {
+                        /* No watchdog reset here: a write the socket accepted
+                         * proves nothing about the server. Its ACK does, and
+                         * that arrives through poll_map_update() below. */
                         last_h2_ping_ms = now;
-                        last_activity_ms = now;
                     } else {
                         ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
                         ml->rc_coord_transport++;
@@ -3898,8 +3934,8 @@ void ml_coord_task(void *arg) {
                 int poll_ret = poll_map_update(ml, &noise);
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
-                    /* Genuine server-originated frame — unlike last_activity_ms
-                     * this is NOT touched by our own PING send, so coord_age
+                    /* Genuine server-originated frame — this is NOT touched
+                     * by our own PING send, so coord_age
                      * (now - ctrl_last_rx_ms) climbs the moment the control
                      * plane goes silent even while the socket still accepts
                      * writes. That climb is the wedge fingerprint. */

@@ -505,9 +505,13 @@ All settings via `idf.py menuconfig` → MicroLink V2 Configuration.
 | `enable_stun` | `true` | Enable STUN NAT discovery |
 | `max_peers` | `16` | Maximum simultaneous active WireGuard tunnels (tailnet can have 300+ peers) |
 | `priority_peer_ip` | `0` | VPN IP of priority peer (guaranteed WG slot) |
+| `keep_all_peers_warm` | `false` | Keep probing every peer's path; by default only peers with traffic in the last 45 s, the exit node and the priority peer |
 | `disco_heartbeat_ms` | `3000` | DISCO keepalive interval |
 | `stun_interval_ms` | `23000` | STUN re-probe interval |
+| `stun_idle_interval_ms` | `300000` | STUN re-probe interval while no peer has traffic (see `keep_all_peers_warm`); set it to `stun_interval_ms` for the old behaviour |
 | `ctrl_watchdog_ms` | `120000` | Control plane watchdog timeout |
+| `ctrl_ping_interval_ms` | `5000` | HTTP/2 PING interval on the control connection; keep it below the NAT/firewall TCP idle timeout and well below `ctrl_watchdog_ms` |
+| `wg_keepalive_s` | `25` | WireGuard persistent keepalive toward peers whose path is maintained (see `keep_all_peers_warm`; `-1` = off, at most `55`) |
 | `wifi_tx_power_dbm` | `0` (default) | WiFi TX power in dBm |
 
 ### Kconfig Options (`idf.py menuconfig`)

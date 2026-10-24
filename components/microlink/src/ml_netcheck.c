@@ -181,32 +181,29 @@ uint16_t ml_netcheck_pick_best_derp(microlink_t *ml) {
         return 0;
     }
 
-    /* Bind the UDP socket to the WiFi STA IP so probes egress the upstream
+    /* Bind the UDP socket to the uplink IP so probes egress the upstream
      * link, not the WireGuard tunnel. Critical when exit-node mode has set
      * netif_default to the WG netif — otherwise probes get filtered by the
      * WG AllowedIPs check and never reach the public STUN servers. */
-    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(sta, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            struct sockaddr_in local = {0};
-            local.sin_family = AF_INET;
-            local.sin_addr.s_addr = ip_info.ip.addr;
-            local.sin_port = 0;  /* ephemeral */
-            if (bind(sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
-                ESP_LOGW(TAG, "bind to STA %lu.%lu.%lu.%lu failed: %d",
-                         (unsigned long)(ip_info.ip.addr & 0xFF),
-                         (unsigned long)((ip_info.ip.addr >> 8) & 0xFF),
-                         (unsigned long)((ip_info.ip.addr >> 16) & 0xFF),
-                         (unsigned long)((ip_info.ip.addr >> 24) & 0xFF),
-                         errno);
-            } else {
-                ESP_LOGI(TAG, "bound netcheck socket to STA %lu.%lu.%lu.%lu",
-                         (unsigned long)(ip_info.ip.addr & 0xFF),
-                         (unsigned long)((ip_info.ip.addr >> 8) & 0xFF),
-                         (unsigned long)((ip_info.ip.addr >> 16) & 0xFF),
-                         (unsigned long)((ip_info.ip.addr >> 24) & 0xFF));
-            }
+    uint32_t uplink_ip = ml_uplink_ipv4(ml);
+    if (uplink_ip != 0) {
+        struct sockaddr_in local = {0};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = uplink_ip;
+        local.sin_port = 0;  /* ephemeral */
+        if (bind(sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            ESP_LOGW(TAG, "bind to uplink %lu.%lu.%lu.%lu failed: %d",
+                     (unsigned long)(uplink_ip & 0xFF),
+                     (unsigned long)((uplink_ip >> 8) & 0xFF),
+                     (unsigned long)((uplink_ip >> 16) & 0xFF),
+                     (unsigned long)((uplink_ip >> 24) & 0xFF),
+                     errno);
+        } else {
+            ESP_LOGI(TAG, "bound netcheck socket to uplink %lu.%lu.%lu.%lu",
+                     (unsigned long)(uplink_ip & 0xFF),
+                     (unsigned long)((uplink_ip >> 8) & 0xFF),
+                     (unsigned long)((uplink_ip >> 16) & 0xFF),
+                     (unsigned long)((uplink_ip >> 24) & 0xFF));
         }
     }
 

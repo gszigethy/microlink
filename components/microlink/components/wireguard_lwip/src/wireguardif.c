@@ -355,6 +355,71 @@ static err_t wireguardif_device_output(struct wireguard_device *device, struct p
 	return udp_sendto(device->udp_pcb, q, ipaddr, port);
 }
 
+static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr, struct wireguard_peer *peer);
+
+// Keep a copy of a packet that has no session to go out on; a newer one replaces it.
+static bool peer_stage_packet(struct wireguard_peer *peer, struct pbuf *q) {
+	struct pbuf *copy = pbuf_clone(PBUF_RAW, PBUF_RAM, q);
+	if (copy) {
+		peer->staged_millis = wireguard_sys_now();
+		struct pbuf *old = __atomic_exchange_n(&peer->staged, copy, __ATOMIC_ACQ_REL);
+		if (old) {
+			pbuf_free(old);
+		}
+	}
+	return copy != NULL;
+}
+
+static void peer_drop_staged(struct wireguard_peer *peer) {
+	struct pbuf *old = __atomic_exchange_n(&peer->staged, NULL, __ATOMIC_ACQ_REL);
+	if (old) {
+		pbuf_free(old);
+	}
+}
+
+// Send the staged packet once a session can carry it. A packet older than the handshake retry
+// window (90 s) is dropped instead: whoever sent it has long given up or retransmitted.
+static bool peer_send_staged(struct wireguard_device *device, struct wireguard_peer *peer) {
+	bool sent = false;
+	struct pbuf *p = __atomic_exchange_n(&peer->staged, NULL, __ATOMIC_ACQ_REL);
+	if (p) {
+		uint32_t staged_millis = peer->staged_millis;
+		if (!wireguard_expired(staged_millis, MAX_HANDSHAKE_ATTEMPTS * REKEY_TIMEOUT)) {
+			err_t err = wireguardif_output_to_peer(device->netif, p, NULL, peer);
+			if (__atomic_load_n(&peer->staged, __ATOMIC_ACQUIRE)) {
+				peer->staged_millis = staged_millis;   // no session after all, staged again: keep its age
+			} else {
+				sent = (err == ERR_OK);
+			}
+		}
+		pbuf_free(p);
+	}
+	return sent;
+}
+
+// Whether wireguardif_output_to_peer would find a keypair to send on (the same choice it makes).
+static bool peer_can_send(struct wireguard_peer *peer) {
+	struct wireguard_keypair *keypair = &peer->curr_keypair;
+	if (keypair->valid && !keypair->initiator && keypair->last_rx == 0) {
+		keypair = &peer->prev_keypair;
+	}
+	return keypair->valid && (keypair->initiator || keypair->last_rx != 0) &&
+	       !wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME);
+}
+
+// Timer side of the held packet: drop it once the handshake retry window has passed, so a peer that
+// never answers does not keep it, and send it if a session is up anyway (it was held while the
+// session was being installed, after the RX path had looked).
+static void peer_tick_staged(struct wireguard_device *device, struct wireguard_peer *peer) {
+	if (__atomic_load_n(&peer->staged, __ATOMIC_RELAXED)) {
+		if (wireguard_expired(peer->staged_millis, MAX_HANDSHAKE_ATTEMPTS * REKEY_TIMEOUT)) {
+			peer_drop_staged(peer);
+		} else if (peer_can_send(peer)) {
+			peer_send_staged(device, peer);
+		}
+	}
+}
+
 static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr, struct wireguard_peer *peer) {
 	// The LWIP IP layer wants to send an IP packet out over the interface - we need to encrypt and send it to the peer
 	struct message_transport_data *hdr;
@@ -366,6 +431,11 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 	uint8_t *dst;
 	uint32_t now;
 	struct wireguard_keypair *keypair = &peer->curr_keypair;
+
+	// Count the attempt, not the success: traffic that is waiting on a handshake is still traffic
+	if (q) {
+		peer->last_payload_tx = wireguard_sys_now();
+	}
 
 	// Note: We may not be able to use the current keypair if we haven't received data, may need to resort to using previous keypair
 	if (keypair->valid && (!keypair->initiator) && (keypair->last_rx == 0)) {
@@ -510,7 +580,10 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 			peer->handshake_attempts = 0;
 			peer->last_initiation_tx = 0;  // bypass 5s gate for first attempt
 		}
-		result = ERR_CONN;
+		// Hold the packet itself until the handshake completes, as wireguard-go does: dropping
+		// it would cost the first packet after every idle lapse (a UDP query, a TCP SYN). A held
+		// packet counts as sent; an error would make the sender give up on it (a ping, a resolver).
+		result = (q && peer_stage_packet(peer, q)) ? ERR_OK : ERR_CONN;
 	}
 	return result;
 }
@@ -579,7 +652,10 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		peer->last_data_tx = 0;        // heard from the peer
 		ESP_LOGW(TAG, "[WG] Session started, sending keepalive to %s:%u",
 		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
-		wireguardif_send_keepalive(device, peer);
+		// The staged packet confirms the session just as well as a keepalive
+		if (!peer_send_staged(device, peer)) {
+			wireguardif_send_keepalive(device, peer);
+		}
 
 		// Set the IF-UP flag on netif
 		netif_set_link_up(device->netif);
@@ -667,6 +743,11 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					// Might need to shuffle next key --> current keypair
 					keypair = keypair_update(peer, keypair);
 
+					// As responder we may send only once the initiator's first packet has arrived
+					if (__atomic_load_n(&peer->staged, __ATOMIC_RELAXED)) {
+						peer_send_staged(device, peer);
+					}
+
 					// Check to see if we should rekey
 					if (keypair->initiator && wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval - REKEY_TIMEOUT)) {
 						peer->send_handshake = true;
@@ -676,6 +757,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					netif_set_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
+						peer->last_payload_rx = now;
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
 						iphdr = (struct ip_hdr *)pbuf->payload;
 						// Replay was checked inside wireguard_decrypt_packet; require a complete header before reading it
@@ -1147,6 +1229,7 @@ err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index) {
 		// Set the flag that we want to try connecting
 		peer->active = false;
 		peer->send_handshake = false;
+		peer_drop_staged(peer);
 		wireguard_destroy_handshake(peer);
 		// Wipe out current keys
 		keypair_destroy(&peer->next_keypair);
@@ -1177,10 +1260,34 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 	return result;
 }
 
+static uint32_t payload_age(uint32_t stamp, uint32_t now) {
+	return stamp ? (now - stamp) : UINT32_MAX;
+}
+
+err_t wireguardif_peer_activity(struct netif *netif, u8_t peer_index, uint32_t *tx_age_ms, uint32_t *rx_age_ms) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		// Stamps first, clock second: a stamp another task writes in between is then never newer
+		// than `now`, so the age cannot wrap around to "ages ago".
+		uint32_t tx = peer->last_payload_tx;
+		uint32_t rx = peer->last_payload_rx;
+		uint32_t now = wireguard_sys_now();
+		if (tx_age_ms) {
+			*tx_age_ms = payload_age(tx, now);
+		}
+		if (rx_age_ms) {
+			*rx_age_ms = payload_age(rx, now);
+		}
+	}
+	return result;
+}
+
 err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
+		peer_drop_staged(peer);
 		crypto_zero(peer, sizeof(struct wireguard_peer));
 		peer->valid = false;
 		result = ERR_OK;
@@ -1209,6 +1316,9 @@ void wireguardif_free(struct netif *netif) {
 	// Idempotent with wireguardif_shutdown: untimeout on a timer that is not
 	// armed is a no-op.
 	sys_untimeout(wireguardif_tmr, device);
+	for (int x = 0; x < WIREGUARD_MAX_PEERS; x++) {
+		peer_drop_staged(&device->peers[x]);
+	}
 	if (device->udp_pcb) {
 		udp_remove(device->udp_pcb);
 		device->udp_pcb = NULL;
@@ -1313,6 +1423,17 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 	return result;
 }
 
+// wireguard-go starts a handshake only on behalf of traffic: a persistent keepalive, or a packet sent
+// or received within the last REKEY_ATTEMPT_TIME (90 s, the window in which it keeps retrying). The
+// timer branches below that are not driven by a packet of their own ask this first, otherwise a peer
+// nobody talks to is re-handshaken every three minutes, forever.
+static bool peer_wants_session(struct wireguard_peer *peer) {
+	const uint32_t attempt_time = MAX_HANDSHAKE_ATTEMPTS * REKEY_TIMEOUT;
+	return peer->keepalive_interval > 0 ||
+	       (peer->last_payload_tx != 0 && !wireguard_expired(peer->last_payload_tx, attempt_time)) ||
+	       (peer->last_payload_rx != 0 && !wireguard_expired(peer->last_payload_rx, attempt_time));
+}
+
 static bool should_send_initiation(struct wireguard_peer *peer) {
 	bool result = false;
 	if (wireguardif_can_send_initiation(peer)) {
@@ -1333,10 +1454,11 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 			         REKEY_TIMEOUT + KEEPALIVE_TIMEOUT,
 			         ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
 			result = true;
-		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval)) {
+		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval) &&
+		           peer_wants_session(peer)) {
 			result = true;
 		} else if (!peer->curr_keypair.valid && peer->active &&
-		           peer->handshake_attempts < MAX_HANDSHAKE_ATTEMPTS) {
+		           peer->handshake_attempts < MAX_HANDSHAKE_ATTEMPTS && peer_wants_session(peer)) {
 			result = true;
 		}
 	}
@@ -1430,6 +1552,7 @@ static void wireguardif_tmr(void *arg) {
 				keypair_destroy(&peer->curr_keypair);
 			}
 			wireguard_expire_keys(peer);   /* prev/next keys and a stale handshake expire on their own clock */
+			peer_tick_staged(device, peer);
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
 			}
@@ -1491,6 +1614,7 @@ void wireguardif_periodic(struct netif *netif) {
 				keypair_destroy(&peer->curr_keypair);
 			}
 			wireguard_expire_keys(peer);
+			peer_tick_staged(device, peer);
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
 			}
@@ -1730,6 +1854,27 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 		// Now start handshake immediately
 		wireguard_start_handshake(netif, peer);
 		result = ERR_OK;
+	}
+	return result;
+}
+
+err_t wireguardif_set_derp_endpoint(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		// The output switch of wireguardif_connect_derp() without the handshake: a valid
+		// keypair keeps working over the relay, and a peer nobody talks to stays quiet.
+		ip_addr_set_any(false, &peer->ip);
+		peer->port = 0;
+	}
+	return result;
+}
+
+err_t wireguardif_set_keepalive(struct netif *netif, u8_t peer_index, u16_t keep_alive) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		peer->keepalive_interval = (keep_alive == WIREGUARDIF_KEEPALIVE_DEFAULT) ? KEEPALIVE_TIMEOUT : keep_alive;
 	}
 	return result;
 }

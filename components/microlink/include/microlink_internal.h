@@ -133,6 +133,13 @@ extern "C" {
  * completed a WireGuard session kept each other busy indefinitely. */
 #define ML_DISCO_CMM_BURST_FLOOR_MS     2500    /* min spacing of CallMeMaybe-triggered ping bursts, per peer */
 #define ML_DISCO_BEST_STICKY_MS         6500    /* keep best_ip/port while it answered this recently (trustUDPAddrDuration) */
+#define ML_DISCO_FULL_PING_MS           60000   /* heartbeat fans out to every endpoint this often, else best only (upgradeUDPDirectInterval) */
+
+/* WireGuard persistent keepalive (seconds) toward warm peers */
+#define ML_WG_KEEPALIVE_S               25
+/* Upper bound: wireguard-lwip rekeys on receive at REJECT_AFTER_TIME - keepalive - REKEY_TIMEOUT
+ * (180 - k - 5 s), before REKEY_AFTER_TIME (120 s) above 55 s, wrapping from 175 s */
+#define ML_WG_KEEPALIVE_MAX_S           55
 
 /* STUN servers (Tailscale primary, Google fallback) */
 #define ML_STUN_PRIMARY_HOST    "derp9.tailscale.com"
@@ -146,11 +153,13 @@ extern "C" {
 #define ML_STUN_RETRANSMIT_MS           100
 #define ML_STUN_TOTAL_TIMEOUT_MS        5000
 #define ML_STUN_RESTUN_INTERVAL_MS      23000
+#define ML_STUN_IDLE_INTERVAL_MS        300000  /* while no peer is warm (tailscaled: none at all) */
 
 /* Control plane timing */
 #define ML_CTRL_WATCHDOG_MS             120000
 #define ML_CTRL_BACKOFF_MAX_MS          30000
 #define ML_CTRL_KEEPALIVE_MS            60000
+#define ML_CTRL_PING_INTERVAL_MS        5000
 /* Stream-liveness watchdog: the mapSession sends a KeepAlive MapResponse
  * roughly every minute (we request KeepAlive=true), so this allows ~5
  * consecutive misses before declaring the session dead. Deliberately much
@@ -335,6 +344,7 @@ typedef struct {
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
     uint64_t last_cmm_rx_ms;        /* Last CallMeMaybe-triggered ping burst (floor) */
     uint64_t best_last_pong_ms;     /* Last direct PONG that came from best_ip:best_port itself */
+    uint64_t last_full_ping_ms;     /* Last heartbeat that went to every endpoint, not just best */
 
     /* DISCO shared secret with this peer (NaCl box beforenm of our disco
      * private key and the peer's disco key), derived once and reused for
@@ -467,6 +477,10 @@ struct microlink_s {
     /* State (atomic reads from any task, writes only from coord) */
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
+
+    /* No peer got path maintenance in the last DISCO pass (written by
+     * wg_mgr, read by coord to slow re-STUN down). */
+    volatile bool peers_idle;
 
     /* True when load_or_generate_keys() found every keypair in NVS at
      * boot (i.e. this device has a persistent node identity). False
@@ -653,7 +667,10 @@ struct microlink_s {
     /* Resolved timing (set during init from config, 0 = default) */
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
+    uint32_t t_stun_idle_interval_ms;
     uint32_t t_ctrl_watchdog_ms;
+    uint32_t t_ctrl_ping_interval_ms;
+    uint16_t t_wg_keepalive_s;      /* 0 = no persistent keepalive */
 
     /* Callbacks */
     microlink_state_cb_t state_cb;
@@ -734,6 +751,9 @@ void ml_coord_task(void *arg);
  * physical uplink, never the exit-node WG tunnel. No-op when no upstream is
  * pinned (exit-node off). Defined in ml_coord.c, also called from ml_derp.c. */
 void ml_bind_sock_to_upstream(microlink_t *ml, int fd);
+/* IPv4 address (network byte order) of the uplink the ESP's own UDP leaves
+ * from, advertised to peers as the LAN endpoint; 0 when there is none. */
+uint32_t ml_uplink_ipv4(microlink_t *ml);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);
