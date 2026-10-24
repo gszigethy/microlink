@@ -168,6 +168,10 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index);
 // connect endpoint switches it back.
 err_t wireguardif_set_derp_endpoint(struct netif *netif, u8_t peer_index);
 
+// Change the given peer's persistent keepalive (seconds, 0 = off, WIREGUARDIF_KEEPALIVE_DEFAULT =
+// KEEPALIVE_TIMEOUT) without touching its session. Call it from the task that runs wireguardif_periodic.
+err_t wireguardif_set_keepalive(struct netif *netif, u8_t peer_index, u16_t keep_alive);
+
 // Inject a received packet into the WireGuard interface (for magicsock demux)
 // This allows an external unified socket to receive all packets and route
 // WireGuard packets to this interface. The packet data is copied internally.

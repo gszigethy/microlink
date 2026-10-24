@@ -1870,6 +1870,15 @@ err_t wireguardif_set_derp_endpoint(struct netif *netif, u8_t peer_index) {
 	return result;
 }
 
+err_t wireguardif_set_keepalive(struct netif *netif, u8_t peer_index, u16_t keep_alive) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		peer->keepalive_interval = (keep_alive == WIREGUARDIF_KEEPALIVE_DEFAULT) ? KEEPALIVE_TIMEOUT : keep_alive;
+	}
+	return result;
+}
+
 err_t wireguardif_inject_packet(struct netif *netif, uint32_t src_ip, uint16_t src_port,
                                  const uint8_t *data, size_t len) {
 	if (!netif || !netif->state || !data || len == 0) {
