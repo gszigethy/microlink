@@ -3681,7 +3681,7 @@ void ml_coord_task(void *arg) {
 
                 /* Stream-liveness watchdog (#32). The transport can look
                  * perfectly healthy — the server's HTTP/2 front end keeps
-                 * ACKing our 5 s PINGs, resetting last_activity_ms — while
+                 * ACKing our PINGs, resetting last_activity_ms — while
                  * the server-side mapSession is silently gone: the admin
                  * console shows the node offline, netmap updates stop, new
                  * peers can't reach us, and existing tunnels keep working
@@ -3888,8 +3888,10 @@ void ml_coord_task(void *arg) {
                         ping_frame[9 + b] = (ping_id >> (56 - b * 8)) & 0xFF;
                     int ping_ret = noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
                     if (ping_ret >= 0) {
+                        /* No watchdog reset here: a write the socket accepted
+                         * proves nothing about the server. Its ACK does, and
+                         * that arrives through poll_map_update() below. */
                         last_h2_ping_ms = now;
-                        last_activity_ms = now;
                     } else {
                         ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
                         ml->rc_coord_transport++;
@@ -3902,8 +3904,8 @@ void ml_coord_task(void *arg) {
                 int poll_ret = poll_map_update(ml, &noise);
                 if (poll_ret > 0) {
                     last_activity_ms = now;  /* Reset watchdog */
-                    /* Genuine server-originated frame — unlike last_activity_ms
-                     * this is NOT touched by our own PING send, so coord_age
+                    /* Genuine server-originated frame — this is NOT touched
+                     * by our own PING send, so coord_age
                      * (now - ctrl_last_rx_ms) climbs the moment the control
                      * plane goes silent even while the socket still accepts
                      * writes. That climb is the wedge fingerprint. */
