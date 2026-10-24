@@ -707,6 +707,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->last_send_ms = 0;
     p->last_cmm_rx_ms = 0;
     p->best_last_pong_ms = 0;
+    p->last_full_ping_ms = 0;
     p->disco_shared_valid = false;
     p->last_upgrade_ms = 0;
     p->has_direct_path = false;
@@ -1191,6 +1192,31 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
                  (int)p->best_port);
     }
 
+    p->last_ping_sent_ms = now;
+}
+
+/* Heartbeat to the confirmed best address only. disco_send_ping_to_peer()
+ * also sends to every netmap endpoint, which is discovery: the reference
+ * client heartbeats bestAddr alone and does that full fan-out at most once
+ * per upgradeUDPDirectInterval (ML_DISCO_FULL_PING_MS) while a direct path
+ * is up. */
+static void disco_send_heartbeat(microlink_t *ml, int peer_idx) {
+    ml_peer_t *p = &ml->peers[peer_idx];
+    uint64_t now = ml_get_time_ms();
+
+    if (p->best_ip == 0 || p->best_port == 0 ||
+        now - p->last_full_ping_ms > ML_DISCO_FULL_PING_MS) {
+        disco_send_ping_to_peer(ml, peer_idx, true);
+        p->last_full_ping_ms = now;
+        return;
+    }
+
+    uint8_t pkt[256];
+    size_t pkt_len = 0;
+    disco_build_ping(ml, peer_idx, pkt, &pkt_len);
+    if (pkt_len == 0) return;
+
+    disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
     p->last_ping_sent_ms = now;
 }
 
@@ -2088,8 +2114,9 @@ static void disco_periodic_probes(microlink_t *ml) {
         }
 
         /* Heartbeat on active direct paths (every HEARTBEAT interval).
-         * MUST use force=true because HEARTBEAT_MS (3s) < PING_INTERVAL_MS (5s),
-         * so the rate limiter would always block heartbeat pings.
+         * disco_send_heartbeat() bypasses the PING_INTERVAL_MS rate limiter
+         * because HEARTBEAT_MS (3s) < PING_INTERVAL_MS (5s), which would
+         * always block heartbeat pings.
          * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms.
          *
          * Only behind a WireGuard session, though. The reference client
@@ -2109,7 +2136,7 @@ static void disco_periodic_probes(microlink_t *ml) {
                                                      (u8_t)p->wg_peer_index, NULL, NULL) == ERR_OK);
             }
             if (session_up) {
-                disco_send_ping_to_peer(ml, i, true);
+                disco_send_heartbeat(ml, i);
             }
         }
     }

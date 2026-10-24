@@ -133,6 +133,7 @@ extern "C" {
  * completed a WireGuard session kept each other busy indefinitely. */
 #define ML_DISCO_CMM_BURST_FLOOR_MS     2500    /* min spacing of CallMeMaybe-triggered ping bursts, per peer */
 #define ML_DISCO_BEST_STICKY_MS         6500    /* keep best_ip/port while it answered this recently (trustUDPAddrDuration) */
+#define ML_DISCO_FULL_PING_MS           60000   /* heartbeat fans out to every endpoint this often, else best only (upgradeUDPDirectInterval) */
 
 /* STUN servers (Tailscale primary, Google fallback) */
 #define ML_STUN_PRIMARY_HOST    "derp9.tailscale.com"
@@ -335,6 +336,7 @@ typedef struct {
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
     uint64_t last_cmm_rx_ms;        /* Last CallMeMaybe-triggered ping burst (floor) */
     uint64_t best_last_pong_ms;     /* Last direct PONG that came from best_ip:best_port itself */
+    uint64_t last_full_ping_ms;     /* Last heartbeat that went to every endpoint, not just best */
 
     /* DISCO shared secret with this peer (NaCl box beforenm of our disco
      * private key and the peer's disco key), derived once and reused for
