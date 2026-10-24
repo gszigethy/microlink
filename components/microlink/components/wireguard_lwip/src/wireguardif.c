@@ -1423,6 +1423,17 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 	return result;
 }
 
+// wireguard-go starts a handshake only on behalf of traffic: a persistent keepalive, or a packet sent
+// or received within the last REKEY_ATTEMPT_TIME (90 s, the window in which it keeps retrying). The
+// timer branches below that are not driven by a packet of their own ask this first, otherwise a peer
+// nobody talks to is re-handshaken every three minutes, forever.
+static bool peer_wants_session(struct wireguard_peer *peer) {
+	const uint32_t attempt_time = MAX_HANDSHAKE_ATTEMPTS * REKEY_TIMEOUT;
+	return peer->keepalive_interval > 0 ||
+	       (peer->last_payload_tx != 0 && !wireguard_expired(peer->last_payload_tx, attempt_time)) ||
+	       (peer->last_payload_rx != 0 && !wireguard_expired(peer->last_payload_rx, attempt_time));
+}
+
 static bool should_send_initiation(struct wireguard_peer *peer) {
 	bool result = false;
 	if (wireguardif_can_send_initiation(peer)) {
@@ -1443,10 +1454,11 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 			         REKEY_TIMEOUT + KEEPALIVE_TIMEOUT,
 			         ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
 			result = true;
-		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval)) {
+		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval) &&
+		           peer_wants_session(peer)) {
 			result = true;
 		} else if (!peer->curr_keypair.valid && peer->active &&
-		           peer->handshake_attempts < MAX_HANDSHAKE_ATTEMPTS) {
+		           peer->handshake_attempts < MAX_HANDSHAKE_ATTEMPTS && peer_wants_session(peer)) {
 			result = true;
 		}
 	}
