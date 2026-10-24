@@ -3801,9 +3801,15 @@ void ml_coord_task(void *arg) {
                     }
                 }
 
-                /* Periodic STUN re-probe (every 23s) — fresh probe sequence */
+                /* Periodic STUN re-probe (every 23s) — fresh probe sequence.
+                 * While no peer carries traffic only every
+                 * t_stun_idle_interval_ms: tailscaled skips periodic re-STUN
+                 * altogether once idle for sessionActiveTimeout, and the first
+                 * pass after the idle spell ends is due at once. */
                 static uint64_t last_stun_ms = 0;
-                if (now - last_stun_ms > ml->t_stun_interval_ms) {
+                uint32_t stun_interval_ms = ml->peers_idle ? ml->t_stun_idle_interval_ms
+                                                           : ml->t_stun_interval_ms;
+                if (now - last_stun_ms > stun_interval_ms) {
                     ml->stun_retry_count = 1;
                     ml->stun_using_fallback = false;
                     ml->stun_last_probe_ms = now;

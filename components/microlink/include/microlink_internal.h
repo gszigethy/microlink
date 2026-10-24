@@ -153,6 +153,7 @@ extern "C" {
 #define ML_STUN_RETRANSMIT_MS           100
 #define ML_STUN_TOTAL_TIMEOUT_MS        5000
 #define ML_STUN_RESTUN_INTERVAL_MS      23000
+#define ML_STUN_IDLE_INTERVAL_MS        300000  /* while no peer is warm (tailscaled: none at all) */
 
 /* Control plane timing */
 #define ML_CTRL_WATCHDOG_MS             120000
@@ -477,6 +478,10 @@ struct microlink_s {
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
 
+    /* No peer got path maintenance in the last DISCO pass (written by
+     * wg_mgr, read by coord to slow re-STUN down). */
+    volatile bool peers_idle;
+
     /* True when load_or_generate_keys() found every keypair in NVS at
      * boot (i.e. this device has a persistent node identity). False
      * when at least one keypair had to be freshly generated — the
@@ -662,6 +667,7 @@ struct microlink_s {
     /* Resolved timing (set during init from config, 0 = default) */
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
+    uint32_t t_stun_idle_interval_ms;
     uint32_t t_ctrl_watchdog_ms;
     uint32_t t_ctrl_ping_interval_ms;
     uint16_t t_wg_keepalive_s;      /* 0 = no persistent keepalive */

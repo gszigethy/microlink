@@ -206,6 +206,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     /* Resolve timing (0 = use defaults from #defines) */
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
     ml->t_stun_interval_ms = ml->config.stun_interval_ms ? ml->config.stun_interval_ms : ML_STUN_RESTUN_INTERVAL_MS;
+    ml->t_stun_idle_interval_ms = ml->config.stun_idle_interval_ms ? ml->config.stun_idle_interval_ms : ML_STUN_IDLE_INTERVAL_MS;
     ml->t_ctrl_watchdog_ms = ml->config.ctrl_watchdog_ms ? ml->config.ctrl_watchdog_ms : ML_CTRL_WATCHDOG_MS;
     ml->t_ctrl_ping_interval_ms = ml->config.ctrl_ping_interval_ms ? ml->config.ctrl_ping_interval_ms : ML_CTRL_PING_INTERVAL_MS;
     ml->t_wg_keepalive_s = ml->config.wg_keepalive_s < 0 ? 0 :

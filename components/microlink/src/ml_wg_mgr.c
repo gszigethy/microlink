@@ -1968,6 +1968,7 @@ static bool disco_peer_is_warm(microlink_t *ml, const ml_peer_t *p) {
 static void disco_periodic_probes(microlink_t *ml) {
     uint64_t now = ml_get_time_ms();
     int upgrade_probes_sent = 0;
+    bool any_warm = false;
 
     /* Rotate start index so we don't always process peers in the same order */
     int start = disco_probe_start_idx;
@@ -1983,6 +1984,7 @@ static void disco_periodic_probes(microlink_t *ml) {
         bool peer_allowed = ml_config_peer_is_allowed(
             ml->config_httpd, p->vpn_ip);
         bool warm = disco_peer_is_warm(ml, p);
+        any_warm |= warm;
 
         /* The persistent keepalive follows the same rule (tailscaled sets
          * none): toward an idle peer it would send a packet every
@@ -2190,6 +2192,8 @@ static void disco_periodic_probes(microlink_t *ml) {
             }
         }
     }
+
+    ml->peers_idle = !any_warm;
 
     /* Advance rotating start index for next call */
     disco_probe_start_idx = (start + DISCO_PROBES_PER_TICK) % (ml->peer_count > 0 ? ml->peer_count : 1);
