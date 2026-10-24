@@ -1754,32 +1754,29 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     plaintext[pt_len++] = 0;  /* version */
 
     /* 1. Local LAN IP endpoint (critical for same-network peers) */
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
-            uint16_t local_port = ml->disco_local_port;
+    uint32_t uplink_ip = ml_uplink_ipv4(ml);
+    if (uplink_ip != 0) {
+        uint32_t local_ip = ntohl(uplink_ip);
+        uint16_t local_port = ml->disco_local_port;
 
-            if (local_port > 0) {
-                /* IPv6-mapped IPv4: ::ffff:A.B.C.D */
-                memset(plaintext + pt_len, 0, 10); pt_len += 10;
-                plaintext[pt_len++] = 0xff;
-                plaintext[pt_len++] = 0xff;
-                plaintext[pt_len++] = (local_ip >> 24) & 0xFF;
-                plaintext[pt_len++] = (local_ip >> 16) & 0xFF;
-                plaintext[pt_len++] = (local_ip >> 8) & 0xFF;
-                plaintext[pt_len++] = local_ip & 0xFF;
-                plaintext[pt_len++] = (local_port >> 8) & 0xFF;
-                plaintext[pt_len++] = local_port & 0xFF;
-                ep_count++;
+        if (local_port > 0) {
+            /* IPv6-mapped IPv4: ::ffff:A.B.C.D */
+            memset(plaintext + pt_len, 0, 10); pt_len += 10;
+            plaintext[pt_len++] = 0xff;
+            plaintext[pt_len++] = 0xff;
+            plaintext[pt_len++] = (local_ip >> 24) & 0xFF;
+            plaintext[pt_len++] = (local_ip >> 16) & 0xFF;
+            plaintext[pt_len++] = (local_ip >> 8) & 0xFF;
+            plaintext[pt_len++] = local_ip & 0xFF;
+            plaintext[pt_len++] = (local_port >> 8) & 0xFF;
+            plaintext[pt_len++] = local_port & 0xFF;
+            ep_count++;
 
-                ESP_LOGD(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
-                         (unsigned long)((local_ip >> 24) & 0xFF),
-                         (unsigned long)((local_ip >> 16) & 0xFF),
-                         (unsigned long)((local_ip >> 8) & 0xFF),
-                         (unsigned long)(local_ip & 0xFF), local_port);
-            }
+            ESP_LOGD(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
+                     (unsigned long)((local_ip >> 24) & 0xFF),
+                     (unsigned long)((local_ip >> 16) & 0xFF),
+                     (unsigned long)((local_ip >> 8) & 0xFF),
+                     (unsigned long)(local_ip & 0xFF), local_port);
         }
     }
 

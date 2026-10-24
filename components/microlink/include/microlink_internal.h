@@ -751,6 +751,9 @@ void ml_coord_task(void *arg);
  * physical uplink, never the exit-node WG tunnel. No-op when no upstream is
  * pinned (exit-node off). Defined in ml_coord.c, also called from ml_derp.c. */
 void ml_bind_sock_to_upstream(microlink_t *ml, int fd);
+/* IPv4 address (network byte order) of the uplink the ESP's own UDP leaves
+ * from, advertised to peers as the LAN endpoint; 0 when there is none. */
+uint32_t ml_uplink_ipv4(microlink_t *ml);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);

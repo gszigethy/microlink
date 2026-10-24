@@ -84,6 +84,33 @@ void ml_bind_sock_to_upstream(microlink_t *ml, int fd)
     }
 }
 
+/* IPv4 address (network byte order) the ESP's own UDP leaves from: the
+ * pinned upstream netif in exit-node mode, else the esp_netif default
+ * (WiFi STA or Ethernet, whichever is the uplink), else the STA. The SoftAP
+ * is not an uplink (it becomes the default when nothing else is up), and
+ * PPP is skipped: behind carrier NAT its address is useless to a peer, and
+ * STUN already supplies the public one. 0 when there is no such address or
+ * its netif is down. */
+uint32_t ml_uplink_ipv4(microlink_t *ml)
+{
+    if (ml && ml->upstream_netif) {
+        const struct netif *up = (const struct netif *)ml->upstream_netif;
+        if (up->name[0] == 'p' && up->name[1] == 'p') return 0;   /* lwIP's PPP netif */
+        return netif_is_up(up) ? ip4_addr_get_u32(netif_ip4_addr(up)) : 0;
+    }
+    esp_netif_t *nif = esp_netif_get_default_netif();
+    const char *key = nif ? esp_netif_get_ifkey(nif) : NULL;
+    if (!nif || (key && strcmp(key, "WIFI_AP_DEF") == 0)) {
+        nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        key = nif ? esp_netif_get_ifkey(nif) : NULL;
+    }
+    if (!nif || !esp_netif_is_netif_up(nif)) return 0;
+    if (key && strncmp(key, "PPP", 3) == 0) return 0;
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(nif, &ip_info) != ESP_OK) return 0;
+    return ip_info.ip.addr;
+}
+
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
@@ -2132,7 +2159,7 @@ check_removed:
 }
 
 /* Add Endpoints + EndpointTypes arrays to a MapRequest JSON object.
- * Includes: WiFi LAN endpoint (type=Local), STUN IPv4 (type=STUN),
+ * Includes: uplink LAN endpoint (type=Local), STUN IPv4 (type=STUN),
  * STUN IPv6 (type=STUN). Returns number of endpoints added. */
 static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     int count = 0;
@@ -2140,23 +2167,20 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     cJSON *et_array = cJSON_AddArrayToObject(root, "EndpointTypes");
     if (!ep_array || !et_array) return 0;
 
-    /* LAN endpoint (WiFi STA) */
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta_netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
-            char ep_str[32];
-            snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
-                     (unsigned long)((local_ip >> 24) & 0xFF),
-                     (unsigned long)((local_ip >> 16) & 0xFF),
-                     (unsigned long)((local_ip >> 8) & 0xFF),
-                     (unsigned long)(local_ip & 0xFF),
-                     ml->disco_local_port);
-            cJSON_AddItemToArray(ep_array, cJSON_CreateString(ep_str));
-            cJSON_AddItemToArray(et_array, cJSON_CreateNumber(1));  /* EndpointLocal */
-            count++;
-        }
+    /* LAN endpoint (uplink netif: WiFi STA or Ethernet) */
+    uint32_t uplink_ip = ml_uplink_ipv4(ml);
+    if (uplink_ip != 0) {
+        uint32_t local_ip = ntohl(uplink_ip);
+        char ep_str[32];
+        snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
+                 (unsigned long)((local_ip >> 24) & 0xFF),
+                 (unsigned long)((local_ip >> 16) & 0xFF),
+                 (unsigned long)((local_ip >> 8) & 0xFF),
+                 (unsigned long)(local_ip & 0xFF),
+                 ml->disco_local_port);
+        cJSON_AddItemToArray(ep_array, cJSON_CreateString(ep_str));
+        cJSON_AddItemToArray(et_array, cJSON_CreateNumber(1));  /* EndpointLocal */
+        count++;
     }
 
     /* PPP endpoint (cellular) — use STUN-discovered public IP as our endpoint */
