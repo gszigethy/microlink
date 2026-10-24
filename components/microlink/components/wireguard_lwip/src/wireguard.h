@@ -208,8 +208,13 @@ struct wireguard_peer {
 	// Incremented in wireguard_start_handshake(), reset in wireguard_start_session().
 	// When >= MAX_HANDSHAKE_ATTEMPTS, should_send_initiation() stops emitting
 	// to avoid wasted retries against peers that have us trimmed. Outgoing
-	// traffic (ERR_CONN path in wireguardif_output_to_peer) re-arms.
+	// traffic (the no-key path in wireguardif_output_to_peer) re-arms.
 	uint8_t handshake_attempts;
+
+	// The last packet that found no session (wireguard-go's staged packets, one deep), sent once
+	// a session is up. The output path and the RX path hand it over with atomic exchanges.
+	struct pbuf *staged;
+	uint32_t staged_millis;
 };
 
 struct wireguard_device {
