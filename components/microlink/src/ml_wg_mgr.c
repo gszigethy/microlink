@@ -781,7 +781,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         ip_addr_set_any(false, &wg_peer.endpoint_ip);
         wg_peer.endport_port = 0;
 
-        wg_peer.keep_alive = 25;
+        wg_peer.keep_alive = ml->t_wg_keepalive_s;
 
         u8_t wg_peer_idx = WIREGUARDIF_INVALID_INDEX;
         err_t wg_err = wireguardif_add_peer(netif, &wg_peer, &wg_peer_idx);

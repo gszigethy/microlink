@@ -207,6 +207,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
     ml->t_stun_interval_ms = ml->config.stun_interval_ms ? ml->config.stun_interval_ms : ML_STUN_RESTUN_INTERVAL_MS;
     ml->t_ctrl_watchdog_ms = ml->config.ctrl_watchdog_ms ? ml->config.ctrl_watchdog_ms : ML_CTRL_WATCHDOG_MS;
+    ml->t_wg_keepalive_s = ml->config.wg_keepalive_s < 0 ? 0 :
+                           ml->config.wg_keepalive_s == 0 ? ML_WG_KEEPALIVE_S :
+                           ml->config.wg_keepalive_s > ML_WG_KEEPALIVE_MAX_S ? ML_WG_KEEPALIVE_MAX_S :
+                           (uint16_t)ml->config.wg_keepalive_s;
 
     /* Apply Kconfig priority peer if set and app didn't provide one */
     if (ml->config.priority_peer_ip == 0 && strlen(CONFIG_ML_PRIORITY_PEER_IP) > 0) {

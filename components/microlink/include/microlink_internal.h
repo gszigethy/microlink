@@ -135,6 +135,12 @@ extern "C" {
 #define ML_DISCO_BEST_STICKY_MS         6500    /* keep best_ip/port while it answered this recently (trustUDPAddrDuration) */
 #define ML_DISCO_FULL_PING_MS           60000   /* heartbeat fans out to every endpoint this often, else best only (upgradeUDPDirectInterval) */
 
+/* WireGuard persistent keepalive (seconds) applied to every peer */
+#define ML_WG_KEEPALIVE_S               25
+/* Upper bound: wireguard-lwip rekeys on receive at REJECT_AFTER_TIME - keepalive - REKEY_TIMEOUT
+ * (180 - k - 5 s), before REKEY_AFTER_TIME (120 s) above 55 s, wrapping from 175 s */
+#define ML_WG_KEEPALIVE_MAX_S           55
+
 /* STUN servers (Tailscale primary, Google fallback) */
 #define ML_STUN_PRIMARY_HOST    "derp9.tailscale.com"
 #define ML_STUN_PRIMARY_PORT    3478
@@ -656,6 +662,7 @@ struct microlink_s {
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
     uint32_t t_ctrl_watchdog_ms;
+    uint16_t t_wg_keepalive_s;      /* 0 = no persistent keepalive */
 
     /* Callbacks */
     microlink_state_cb_t state_cb;
