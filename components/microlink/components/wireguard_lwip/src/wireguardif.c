@@ -83,13 +83,14 @@ static StaticSemaphore_t s_wg_tx_lock_buf;
 static const char *TAG = "wg";
 
 // Per-packet verbose debug (data path, ~140 pps) - disable for production.
-// Set to 0 to disable verbose WireGuard debug output. The low-frequency
-// control/handshake-path diagnostics below are emitted via ESP_LOGW instead
-// of raw printf so the SD flight-recorder (esp_log_set_vprintf hook) captures
-// them; raw printf is NOT captured. They are WARN level on purpose: this build
-// sets CONFIG_LOG_MAXIMUM_LEVEL=2 (WARN), so ESP_LOGI/D are compiled OUT and
-// would never reach the recorder. Keep this 0: those WG_DEBUG markers sit on
-// the per-packet data path and would flood both serial and the SD card.
+// Set to 0 to disable verbose WireGuard debug output. The handshake-path
+// diagnostics below go through ESP_LOG so the SD flight recorder
+// (esp_log_set_vprintf hook) captures them; raw printf is not captured.
+// A handshake that works is routine and is logged at INFO (every peer rekeys
+// every two minutes); failures and session resets/teardowns ([WG_RESET],
+// [WG_DESTROY]) stay at WARN so the recorder keeps them at its default level.
+// Keep this 0: the WG_DEBUG markers sit on the per-packet data path and would
+// flood both serial and the SD card.
 #define WG_DEBUG_LOGGING 0
 
 #if WG_DEBUG_LOGGING
@@ -103,9 +104,10 @@ static const char *TAG = "wg";
  * per handshake retry AND, for [WG_REKEY], once per *data packet* while a
  * keypair is stuck expired — i.e. a flood for offline DERP peers / stuck
  * rekeys. Gate them behind this flag (default OFF) so they don't fill the SD
- * recorder; flip to 1 to debug the handshake/DERP send path again. The rare,
- * high-value logs (WG_OUT_FAIL, all WG_RX, HANDSHAKE COMPLETE / SESSION
- * ESTABLISHED, WG_RESET/DESTROY, force_derp) stay unconditional ESP_LOGW. */
+ * recorder; flip to 1 to debug the handshake/DERP send path again. Failures
+ * and session resets (WG_OUT_FAIL, WG_RX failures, WG_REHANDSHAKE,
+ * WG_RESET/DESTROY, force_derp) stay unconditional ESP_LOGW; a handshake that
+ * completes (WG_RX steps, HANDSHAKE COMPLETE / SESSION ESTABLISHED) is INFO. */
 #define WG_HS_TRACE 0
 #if WG_HS_TRACE
 #define WG_HSLOG(...) ESP_LOGW(TAG, __VA_ARGS__)
@@ -125,6 +127,38 @@ void wireguardif_disable_socket_bind(void) {
 	g_disable_socket_bind = true;
 }
 
+// netif_set_link_up()/netif_set_link_down() change core lwIP netif state and
+// run the link callbacks, so they belong on the TCPIP thread; this firmware
+// runs lwIP without core locking. The handshake paths below run on the
+// WireGuard manager task (wireguardif_network_rx, wireguardif_periodic) as
+// well as on the TCPIP thread (wireguardif_tmr, the zero-copy receive path).
+// On the TCPIP thread the call is made directly: posting it from there would
+// queue it behind a pending interface take-down and run it on a freed netif.
+// From any other task it is posted; the manager task is also the one that
+// takes the interface down, so its post is always ahead of its own take-down
+// in the TCPIP mailbox. The flag is read first, so once the link is up the
+// per-handshake call costs one load; a stale read costs one redundant call.
+// (Same change as esphome-tailscale 0.5.19 / upstream microlink PR #28, with
+// the TCPIP-thread shortcut added.)
+static void wireguardif_link_up_cb(void *arg) {
+	netif_set_link_up((struct netif *)arg);
+}
+static void wireguardif_link_down_cb(void *arg) {
+	netif_set_link_down((struct netif *)arg);
+}
+static void wireguardif_mark_link(struct netif *netif, bool up) {
+	if (((netif->flags & NETIF_FLAG_LINK_UP) != 0) == up) {
+		return;
+	}
+	if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+		if (up) netif_set_link_up(netif); else netif_set_link_down(netif);
+		return;
+	}
+	if (tcpip_callback(up ? wireguardif_link_up_cb : wireguardif_link_down_cb, netif) != ERR_OK) {
+		ESP_LOGW(TAG, "[WG] link %s not posted to the TCPIP thread (mailbox full), retried on the next transition", up ? "up" : "down");
+	}
+}
+
 bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
 	if (len < 4) return false;
 	// WireGuard message types are 1-4 in the first 32-bit LE word
@@ -136,12 +170,25 @@ bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
 // Only ever called for a packet that has just authenticated (initiation,
 // response, cookie reply, transport data), so it is also where a working direct
 // path is proven: stamp last_rx_direct here, never for DERP-relayed packets.
-static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
+static void update_peer_addr(struct wireguard_device *device, struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
 	// Don't overwrite a valid endpoint with 0.0.0.0 (DERP-injected packets have no real source)
 	// This bug was causing DERP routing to break after receiving the first packet
 	if (ip_addr_isany(addr)) {
 		WG_DEBUG("[WG] update_peer_addr: skipping DERP (0.0.0.0)\n");
 		return;  // Skip updating endpoint for DERP packets
+	}
+	// A peer can reach our WireGuard port through the tunnel itself (the socket
+	// is bound to 0.0.0.0), and the packet then arrives from its tailnet
+	// address. That is not a path: see wireguardif_endpoint_usable().
+	if (!wireguardif_endpoint_usable(device->netif, addr)) {
+		static uint32_t last_refused_log;
+		uint32_t now = wireguard_sys_now();
+		if (last_refused_log == 0 || now - last_refused_log > 60000) {
+			ESP_LOGW(TAG, "[WG] packet from %s:%u authenticated, but that address cannot be an endpoint; keeping the current one",
+			         ipaddr_ntoa(addr), port);
+			last_refused_log = now ? now : 1;
+		}
+		return;
 	}
 	WG_DEBUG("[WG] update_peer_addr: %s:%u\n", ipaddr_ntoa(addr), port);
 	peer->ip = *addr;
@@ -170,6 +217,52 @@ bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip) {
 			if (ip4_addr_get_u32(ip_2_ip4(&aip->ip)) == ip4_addr_get_u32(ip)) return true;
 		}
 	}
+	return false;
+}
+
+// Can `addr` be the outer (underlay) address of a peer?
+//
+// Refused: unspecified, 0.0.0.0/8, loopback, link-local, multicast, reserved
+// and broadcast addresses, and any address that is a tailnet node: our own
+// tunnel address or a peer's host route. With such an endpoint the encrypted
+// packet is routed back into this interface, encrypted for the same peer and
+// sent to the same address again, until the stack overflows; any tailnet peer
+// can cause it by sending a valid WireGuard packet to our tunnel address, or by
+// offering its tailnet address in a CallMeMaybe.
+//
+// 100.64.0.0/10 as a whole is NOT refused, unlike upstream microlink
+// (2e567c6): an uplink can live in that range (Starlink, LTE/5G routers,
+// carrier NAT), and a peer on the same LAN is then legitimately reached at a
+// 100.64.x.x address that is not a tailnet node. The host-route test is exact.
+// The outer path is IPv4-only, so an IPv6 address is refused when it could
+// only be reached through the tunnel or hides an IPv4 address.
+bool wireguardif_endpoint_usable(struct netif *netif, const ip_addr_t *addr) {
+	if (!addr) return false;
+#if LWIP_IPV4
+	if (IP_IS_V4(addr)) {
+		const uint32_t a = PP_NTOHL(ip4_addr_get_u32(ip_2_ip4(addr)));
+		if ((a >> 24) == 0 || (a >> 24) == 127) return false;          // 0.0.0.0/8, loopback
+		if ((a & 0xFFFF0000u) == 0xA9FE0000u) return false;            // 169.254.0.0/16 link-local
+		if ((a >> 28) >= 0xE) return false;                            // multicast, reserved, broadcast
+		if (netif) {
+			if (ip4_addr_get_u32(netif_ip4_addr(netif)) == ip4_addr_get_u32(ip_2_ip4(addr))) return false;
+			if (wireguardif_has_host_route(netif, ip_2_ip4(addr))) return false;
+		}
+		return true;
+	}
+#endif
+#if LWIP_IPV6
+	if (IP_IS_V6(addr)) {
+		const uint32_t w0 = PP_NTOHL(ip_2_ip6(addr)->addr[0]);
+		const uint32_t w1 = PP_NTOHL(ip_2_ip6(addr)->addr[1]);
+		const uint32_t w2 = PP_NTOHL(ip_2_ip6(addr)->addr[2]);
+		if (w0 == 0xfd7a115cu && (w1 >> 16) == 0xa1e0u) return false;  // fd7a:115c:a1e0::/48 tailnet
+		if ((w0 >> 24) == 0xff) return false;                          // multicast
+		if ((w0 & 0xffc00000u) == 0xfe800000u) return false;           // fe80::/10 link-local
+		if (w0 == 0 && w1 == 0 && (w2 == 0 || w2 == 0x0000ffffu)) return false;  // ::/96, IPv4-mapped
+		return true;
+	}
+#endif
 	return false;
 }
 
@@ -643,18 +736,18 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 	if (wireguard_process_handshake_response(device, peer, response) && wireguard_start_session(peer, true)) {
 		// Packet is good — identify the peer
 		uint8_t wg_idx = wireguard_peer_index(device, peer);
-		ESP_LOGW(TAG, "[WG] *** HANDSHAKE COMPLETE! wg_idx=%u key=%02x%02x%02x%02x "
+		ESP_LOGI(TAG, "[WG] *** HANDSHAKE COMPLETE! wg_idx=%u key=%02x%02x%02x%02x "
 		       "from=%s:%u ***",
 		       wg_idx,
 		       peer->public_key[0], peer->public_key[1],
 		       peer->public_key[2], peer->public_key[3],
 		       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
 		// Update the peer location
-		update_peer_addr(peer, addr, port);
+		update_peer_addr(device, peer, addr, port);
 
 		peer->handshake_attempts = 0;  // session up, reset retry counter
 		peer->last_data_tx = 0;        // heard from the peer
-		ESP_LOGW(TAG, "[WG] Session started, sending keepalive to %s:%u",
+		ESP_LOGI(TAG, "[WG] Session started, sending keepalive to %s:%u",
 		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
 		// The staged packet confirms the session just as well as a keepalive
 		if (!peer_send_staged(device, peer)) {
@@ -662,8 +755,8 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		}
 
 		// Set the IF-UP flag on netif
-		netif_set_link_up(device->netif);
-		ESP_LOGW(TAG, "[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***", wg_idx);
+		wireguardif_mark_link(device->netif, true);
+		ESP_LOGI(TAG, "[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***", wg_idx);
 	} else {
 		// Packet bad
 		ESP_LOGW(TAG, "[WG] Handshake response INVALID (crypto failed)");
@@ -737,7 +830,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 					// 3. Since the packet has authenticated correctly, the source IP of the outer UDP/IP packet is used to update the endpoint for peer TrMv...WXX0.
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					update_peer_addr(device, peer, addr, port);
 
 					now = wireguard_sys_now();
 					keypair->last_rx = now;
@@ -758,7 +851,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					}
 
 					// Make sure that link is reported as up
-					netif_set_link_up(device->netif);
+					wireguardif_mark_link(device->netif, true);
 
 					if (pbuf->tot_len > 0) {
 						peer->last_payload_rx = now;
@@ -1056,18 +1149,18 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 	switch (type) {
 		case MESSAGE_HANDSHAKE_INITIATION:
 			msg_initiation = (struct message_handshake_initiation *)data;
-			ESP_LOGW(TAG, "[WG_RX] Handshake INITIATION from peer, sender_idx=%lu",
+			ESP_LOGI(TAG, "[WG_RX] Handshake INITIATION from peer, sender_idx=%lu",
 				(unsigned long)msg_initiation->sender);
 
 			// Check mac1 (and optionally mac2) are correct - note it may internally generate a cookie reply packet
 			if (wireguardif_check_initiation_message(device, msg_initiation, addr, port)) {
-				ESP_LOGW(TAG, "[WG_RX] Initiation MAC check PASSED");
+				ESP_LOGI(TAG, "[WG_RX] Initiation MAC check PASSED");
 
 				peer = wireguard_process_initiation_message(device, msg_initiation);
 				if (peer) {
-					ESP_LOGW(TAG, "[WG_RX] Initiation processed OK, sending response");
+					ESP_LOGI(TAG, "[WG_RX] Initiation processed OK, sending response");
 					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					update_peer_addr(device, peer, addr, port);
 
 					// If initiation arrived via DERP (addr=0.0.0.0), send response
 					// via DERP too by temporarily clearing the peer endpoint.
@@ -1080,7 +1173,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 						saved_port = peer->port;
 						ip_addr_set_any(false, &peer->ip);
 						peer->port = 0;
-						ESP_LOGW(TAG, "[WG_RX] Sending response via DERP (initiation was relayed)");
+						ESP_LOGI(TAG, "[WG_RX] Sending response via DERP (initiation was relayed)");
 					}
 
 					// Send back a handshake response
@@ -1101,16 +1194,16 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 
 		case MESSAGE_HANDSHAKE_RESPONSE:
 			msg_response = (struct message_handshake_response *)data;
-			ESP_LOGW(TAG, "[WG_RX] Handshake RESPONSE! receiver_idx=%lu sender_idx=%lu",
+			ESP_LOGI(TAG, "[WG_RX] Handshake RESPONSE! receiver_idx=%lu sender_idx=%lu",
 				(unsigned long)msg_response->receiver, (unsigned long)msg_response->sender);
 
 			// Check mac1 (and optionally mac2) are correct - note it may internally generate a cookie reply packet
 			if (wireguardif_check_response_message(device, msg_response, addr, port)) {
-				ESP_LOGW(TAG, "[WG_RX] Response MAC check PASSED");
+				ESP_LOGI(TAG, "[WG_RX] Response MAC check PASSED");
 
 				peer = peer_lookup_by_handshake(device, msg_response->receiver);
 				if (peer) {
-					ESP_LOGW(TAG, "[WG_RX] Peer found for handshake, processing response");
+					ESP_LOGI(TAG, "[WG_RX] Peer found for handshake, processing response");
 					// Process the handshake response
 					wireguardif_process_response_message(device, peer, msg_response, addr, port);
 				} else {
@@ -1126,8 +1219,10 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 			peer = peer_lookup_by_handshake(device, msg_cookie->receiver);
 			if (peer) {
 				if (wireguard_process_cookie_message(device, peer, msg_cookie)) {
-					// Update the peer location
-					update_peer_addr(peer, addr, port);
+					// The endpoint is not updated here. A cookie reply proves no
+					// session, and wireguard-go only moves the endpoint on an
+					// authenticated initiation, response or transport packet
+					// (SetEndpointFromPacket in device/receive.go).
 
 					// Don't send anything out - we stay quiet until the next initiation message
 				}
@@ -1335,6 +1430,10 @@ void wireguardif_free(struct netif *netif) {
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	// 0.0.0.0 stays allowed: it is how a caller clears the endpoint (relay only).
+	if (result == ERR_OK && !ip_addr_isany(ip) && !wireguardif_endpoint_usable(netif, ip)) {
+		result = ERR_ARG;
+	}
 	if (result == ERR_OK) {
 		peer->connect_ip = *ip;
 		peer->connect_port = port;
@@ -1572,7 +1671,7 @@ static void wireguardif_tmr(void *arg) {
 
 	if (!link_up) {
 		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
+		wireguardif_mark_link(device->netif, false);
 	}
 }
 
@@ -1646,7 +1745,7 @@ void wireguardif_periodic(struct netif *netif) {
 		}
 	}
 	if (!link_up) {
-		netif_set_link_down(device->netif);
+		wireguardif_mark_link(device->netif, false);
 	}
 }
 

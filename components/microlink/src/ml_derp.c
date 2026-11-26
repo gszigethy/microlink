@@ -444,7 +444,13 @@ static int poll_derp_read(microlink_t *ml) {
     }
 
     /* For RecvPacket (0x05): first 32 bytes are sender's public key */
-    if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
+    if (frame_type == DERP_FRAME_RECV_PACKET && len <= 32) {
+        /* Too short to carry a source key and a payload: drop it instead of
+         * routing it with an all-zero source key. (Upstream microlink f2ade3e.) */
+        free(buf);
+        return 1;
+    }
+    if (frame_type == DERP_FRAME_RECV_PACKET) {
         memcpy(src_key, buf, 32);
         payload = malloc(len - 32);
         if (payload) {
@@ -549,16 +555,13 @@ void ml_derp_tx_task(void *arg) {
          * the instant it blocks in a socket call. */
         ml->derp_last_heartbeat_ms = loop_start;
 
-        /* Unconditional heartbeat - proves task is alive. Was ESP_LOGW so
-         * it would survive any default-log-level filter while debugging
-         * the DERP-stall issue; now downgraded to INFO since the /log
-         * ring + /tailscale diag panel cover that need and the W-spam
-         * was drowning real warnings. */
-        /* TEMP 2026-05-27: WARN + 2s so the SD recorder captures the DERP frame
-         * rate during the exit-node throughput hunt (loop_count vs frames_tx/rx
-         * tells us if the loop spins without progress or is genuinely starved). */
-        if (loop_start - last_heartbeat_ms > 2000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+        /* Heartbeat: proves the task is alive. INFO and once a minute. It was
+         * a temporary WARN every 2 s for the 2026-05 exit-node throughput hunt
+         * and stayed that way: at the default WARN level it put a line on the
+         * console and the SD recorder every 2 s. The liveness stamp above and
+         * the diag panel cover the watchdog need. */
+        if (loop_start - last_heartbeat_ms > 60000) {
+            ESP_LOGI(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
@@ -568,8 +571,8 @@ void ml_derp_tx_task(void *arg) {
         /* ---- Periodic status logging (always, even when disconnected) ---- */
         {
             uint64_t now_ms = loop_start;
-            if (now_ms - last_status_ms > 10000) {
-                ESP_LOGW(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
+            if (now_ms - last_status_ms > 60000) {
+                ESP_LOGI(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
                          (unsigned long)s_derp_frames_rx, (unsigned long)frames_tx,
                          (unsigned long)loop_count);
@@ -781,6 +784,15 @@ void ml_derp_rx_task(void *arg) {
  * DERP Connection Management (called from coord task)
  * ========================================================================== */
 
+/* Drop the saved TLS session (see ml_derp_conn_t). Safe to call when none. */
+void ml_derp_free_saved_session(microlink_t *ml) {
+    if (ml->derp.have_saved_session) {
+        mbedtls_ssl_session_free(&ml->derp.saved_session);
+        ml->derp.have_saved_session = false;
+    }
+    ml->derp.saved_session_name[0] = '\0';
+}
+
 esp_err_t ml_derp_connect(microlink_t *ml) {
     /* Determine DERP host/port from DERPMap with node failover.
      * Always start from node 0 (the first/preferred node in the DERPMap).
@@ -885,7 +897,18 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     int64_t t_derp_tcp = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
 
-    /* TLS setup */
+    /* TLS setup. Free any prior state first: mbedtls_*_init() only zeroes the
+     * structs, so buffers left by a connect that got past mbedtls_ssl_setup()
+     * and then failed on a path that skipped fail_tls, or by a session torn
+     * down without ml_derp_disconnect(), would be orphaned, and the
+     * dynamic-buffer code would start the next handshake on a half-initialised
+     * context. The free functions are safe on zeroed and on already-freed
+     * structs. (esphome-tailscale 0.5.19.) */
+    mbedtls_ssl_free(&ml->derp.ssl);
+    mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+    mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
+    mbedtls_entropy_free(&ml->derp.entropy);
+
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
     mbedtls_entropy_init(&ml->derp.entropy);
@@ -938,6 +961,23 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     mbedtls_ssl_set_bio(&ml->derp.ssl, &ml->derp.sockfd,
                          ml_derp_bio_send, NULL, ml_derp_bio_recv_timeout);
 
+    /* Resume the TLS session saved by the previous successful connect, if
+     * it was made to the same relay name: a resumed handshake skips the key
+     * exchange and the certificate chain, which is most of the time a relay
+     * reconnect spends. Only a server holding the ticket key of the session
+     * we verified can complete it; anyone else gets a full handshake with
+     * the certificate check. Best effort: on any failure it is a full
+     * handshake (esphome-tailscale 0.5.20, from the cplewes fork). */
+    bool resume_tried = false;
+    if (ml->derp.have_saved_session && strcmp(ml->derp.saved_session_name, tls_name) == 0) {
+        int sret = mbedtls_ssl_set_session(&ml->derp.ssl, &ml->derp.saved_session);
+        if (sret == 0) {
+            resume_tried = true;
+        } else {
+            ESP_LOGW(TAG, "DERP TLS: set_session -0x%04x, full handshake", -sret);
+        }
+    }
+
     /* TLS handshake - socket has 10s SO_RCVTIMEO from connect phase. */
     int ret;
     while ((ret = mbedtls_ssl_handshake(&ml->derp.ssl)) != 0) {
@@ -962,8 +1002,21 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     int64_t t_derp_tls = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP TLS handshake: %lld ms", (t_derp_tls - t_derp_tcp) / 1000);
+    ESP_LOGI(TAG, "[TIMING] DERP TLS handshake: %lld ms%s", (t_derp_tls - t_derp_tcp) / 1000,
+             resume_tried ? " (session resumption offered)" : "");
     ESP_LOGI(TAG, "TLS connected to DERP");
+
+    /* Save the negotiated session for the next connect. get_session deep-
+     * copies the ticket, so the previous copy is dropped first. Done right
+     * after the handshake: with TLS 1.2 the ticket is part of it. */
+    ml_derp_free_saved_session(ml);
+    mbedtls_ssl_session_init(&ml->derp.saved_session);
+    if (mbedtls_ssl_get_session(&ml->derp.ssl, &ml->derp.saved_session) == 0) {
+        ml->derp.have_saved_session = true;
+        strlcpy(ml->derp.saved_session_name, tls_name, sizeof(ml->derp.saved_session_name));
+    } else {
+        mbedtls_ssl_session_free(&ml->derp.saved_session);
+    }
 
     /* HTTP Upgrade: GET /derp with Upgrade: DERP header */
     char upgrade_req[256];
@@ -1022,7 +1075,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 
         resp_buf[resp_len] = '\0';
 
-        if (!found_end || strstr((char *)resp_buf, "101") == NULL) {
+        /* The status line must be the upgrade itself; "101" anywhere in the
+         * headers (a date, a length, a cookie) is not. */
+        if (!found_end || (strncmp((char *)resp_buf, "HTTP/1.1 101", 12) != 0 &&
+                           strncmp((char *)resp_buf, "HTTP/1.0 101", 12) != 0)) {
             ESP_LOGE(TAG, "DERP upgrade rejected: %.100s", resp_buf);
             goto fail_tls;
         }
